@@ -60,6 +60,7 @@ def main():
                 mp_image,
                 timestamp_ms,
             )
+            
 
             # Draw each detected landmark as a small point.
             if result.face_landmarks:
