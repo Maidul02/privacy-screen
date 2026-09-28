@@ -9,6 +9,7 @@ import numpy as np
 
 MODEL_PATH = Path("models/face_landmarker.task")
 
+
 # MediaPipe landmark indices used for head-pose estimation.
 HEAD_POSE_LANDMARKS = {
     "nose": 1,
@@ -18,6 +19,25 @@ HEAD_POSE_LANDMARKS = {
     "left_mouth": 61,
     "right_mouth": 291,
 }
+
+
+# MediaPipe landmark indices used for eye-position estimation.
+LEFT_EYE = {
+    "outer": 33,
+    "inner": 133,
+    "top": 159,
+    "bottom": 145,
+    "iris": 468,
+}
+
+RIGHT_EYE = {
+    "outer": 263,
+    "inner": 362,
+    "top": 386,
+    "bottom": 374,
+    "iris": 473,
+}
+
 
 # Approximate 3D reference model of the selected facial points.
 # The order must match HEAD_POSE_LANDMARKS.
@@ -34,7 +54,11 @@ FACE_MODEL_POINTS = np.array(
 )
 
 
-def get_head_pose_image_points(face_landmarks, frame_width, frame_height):
+def get_head_pose_image_points(
+    face_landmarks,
+    frame_width,
+    frame_height,
+):
     """Convert selected normalized MediaPipe landmarks to pixel coordinates."""
     image_points = []
 
@@ -90,6 +114,7 @@ def rotation_matrix_to_euler_angles(rotation_matrix):
             rotation_matrix[1, 0],
             rotation_matrix[0, 0],
         )
+
     else:
         pitch = math.atan2(
             -rotation_matrix[1, 2],
@@ -110,8 +135,53 @@ def rotation_matrix_to_euler_angles(rotation_matrix):
     )
 
 
-def estimate_head_pose(face_landmarks, frame_width, frame_height):
-    """Estimate raw yaw, pitch, and roll from facial landmarks."""
+def normalize_pitch(pitch):
+    """Shift the current pitch convention to a centre-relative range."""
+    shifted_pitch = pitch - 180.0
+
+    return (shifted_pitch + 180.0) % 360.0 - 180.0
+
+
+def calculate_horizontal_eye_ratio(
+    face_landmarks,
+    eye_landmarks,
+):
+    """Calculate iris position relative to the horizontal eye corners."""
+    outer = face_landmarks[eye_landmarks["outer"]]
+    inner = face_landmarks[eye_landmarks["inner"]]
+    iris = face_landmarks[eye_landmarks["iris"]]
+
+    eye_width = inner.x - outer.x
+
+    if abs(eye_width) < 1e-6:
+        return None
+
+    return (iris.x - outer.x) / eye_width
+
+
+def calculate_vertical_eye_ratio(
+    face_landmarks,
+    eye_landmarks,
+):
+    """Calculate iris position relative to the vertical eye boundaries."""
+    top = face_landmarks[eye_landmarks["top"]]
+    bottom = face_landmarks[eye_landmarks["bottom"]]
+    iris = face_landmarks[eye_landmarks["iris"]]
+
+    eye_height = bottom.y - top.y
+
+    if abs(eye_height) < 1e-6:
+        return None
+
+    return (iris.y - top.y) / eye_height
+
+
+def estimate_head_pose(
+    face_landmarks,
+    frame_width,
+    frame_height,
+):
+    """Estimate yaw, normalized pitch, and roll from facial landmarks."""
     image_points = get_head_pose_image_points(
         face_landmarks,
         frame_width,
@@ -146,6 +216,8 @@ def estimate_head_pose(face_landmarks, frame_width, frame_height):
         rotation_matrix
     )
 
+    pitch = normalize_pitch(pitch)
+
     return yaw, pitch, roll
 
 
@@ -170,12 +242,23 @@ def main():
         print("Error: Could not open webcam.")
         return
 
-    print("Webcam started. Press Q to quit.")
+    print("Webcam started.")
+    print("Press C to calibrate the screen centre.")
+    print("Press Q to quit.")
 
     previous_time = time.perf_counter()
     start_time = time.perf_counter()
 
-    with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
+    # Centre-calibration state.
+    calibration_active = False
+    calibration_target_samples = 90
+    calibration_samples = []
+    centre_calibration = None
+
+    with mp.tasks.vision.FaceLandmarker.create_from_options(
+        options
+    ) as landmarker:
+
         while True:
             success, frame = camera.read()
 
@@ -211,10 +294,74 @@ def main():
                 # num_faces=1, so use the first detected face.
                 face_landmarks = result.face_landmarks[0]
 
-                # Draw all facial landmarks.
+                # ---------------------------------------------------------
+                # Horizontal eye-position estimation
+                # ---------------------------------------------------------
+
+                left_eye_ratio = calculate_horizontal_eye_ratio(
+                    face_landmarks,
+                    LEFT_EYE,
+                )
+
+                right_eye_ratio = calculate_horizontal_eye_ratio(
+                    face_landmarks,
+                    RIGHT_EYE,
+                )
+
+                combined_eye_ratio = None
+
+                if (
+                    left_eye_ratio is not None
+                    and right_eye_ratio is not None
+                ):
+                    # The two eyes use opposite horizontal directions.
+                    # Flip the right-eye ratio before combining them.
+                    normalized_right_eye_ratio = (
+                        1.0 - right_eye_ratio
+                    )
+
+                    combined_eye_ratio = (
+                        left_eye_ratio
+                        + normalized_right_eye_ratio
+                    ) / 2
+
+                # ---------------------------------------------------------
+                # Vertical eye-position estimation
+                # ---------------------------------------------------------
+
+                left_vertical_ratio = calculate_vertical_eye_ratio(
+                    face_landmarks,
+                    LEFT_EYE,
+                )
+
+                right_vertical_ratio = calculate_vertical_eye_ratio(
+                    face_landmarks,
+                    RIGHT_EYE,
+                )
+
+                combined_vertical_ratio = None
+
+                if (
+                    left_vertical_ratio is not None
+                    and right_vertical_ratio is not None
+                ):
+                    combined_vertical_ratio = (
+                        left_vertical_ratio
+                        + right_vertical_ratio
+                    ) / 2
+
+                # ---------------------------------------------------------
+                # Draw all facial landmarks
+                # ---------------------------------------------------------
+
                 for landmark in face_landmarks:
-                    pixel_x = int(landmark.x * frame_width)
-                    pixel_y = int(landmark.y * frame_height)
+                    pixel_x = int(
+                        landmark.x * frame_width
+                    )
+
+                    pixel_y = int(
+                        landmark.y * frame_height
+                    )
 
                     cv2.circle(
                         frame,
@@ -224,7 +371,36 @@ def main():
                         -1,
                     )
 
-                # Estimate raw head orientation.
+                # ---------------------------------------------------------
+                # Highlight iris landmarks
+                # ---------------------------------------------------------
+
+                for iris_index in (
+                    LEFT_EYE["iris"],
+                    RIGHT_EYE["iris"],
+                ):
+                    iris_landmark = face_landmarks[iris_index]
+
+                    iris_x = int(
+                        iris_landmark.x * frame_width
+                    )
+
+                    iris_y = int(
+                        iris_landmark.y * frame_height
+                    )
+
+                    cv2.circle(
+                        frame,
+                        (iris_x, iris_y),
+                        4,
+                        (0, 0, 255),
+                        -1,
+                    )
+
+                # ---------------------------------------------------------
+                # Head-pose estimation
+                # ---------------------------------------------------------
+
                 head_pose = estimate_head_pose(
                     face_landmarks,
                     frame_width,
@@ -234,18 +410,106 @@ def main():
                 if head_pose is not None:
                     yaw, pitch, roll = head_pose
 
-                    nose_landmark = face_landmarks[HEAD_POSE_LANDMARKS["nose"]]
-                    nose_x = int(nose_landmark.x * frame_width)
-                    nose_y = int(nose_landmark.y * frame_height)
+                    # -----------------------------------------------------
+                    # Centre calibration
+                    # -----------------------------------------------------
+
+                    if (
+                        calibration_active
+                        and combined_eye_ratio is not None
+                        and combined_vertical_ratio is not None
+                    ):
+                        calibration_samples.append(
+                            {
+                                "yaw": yaw,
+                                "pitch": pitch,
+                                "horizontal_eye": combined_eye_ratio,
+                                "vertical_eye": combined_vertical_ratio,
+                            }
+                        )
+
+                        if (
+                            len(calibration_samples)
+                            >= calibration_target_samples
+                        ):
+                            sample_count = len(calibration_samples)
+
+                            centre_calibration = {
+                                "yaw": sum(
+                                    sample["yaw"]
+                                    for sample in calibration_samples
+                                ) / sample_count,
+
+                                "pitch": sum(
+                                    sample["pitch"]
+                                    for sample in calibration_samples
+                                ) / sample_count,
+
+                                "horizontal_eye": sum(
+                                    sample["horizontal_eye"]
+                                    for sample in calibration_samples
+                                ) / sample_count,
+
+                                "vertical_eye": sum(
+                                    sample["vertical_eye"]
+                                    for sample in calibration_samples
+                                ) / sample_count,
+                            }
+
+                            calibration_active = False
+
+                            print("\nCentre calibration complete:")
+                            print(
+                                "Yaw: "
+                                f"{centre_calibration['yaw']:.2f}"
+                            )
+                            print(
+                                "Pitch: "
+                                f"{centre_calibration['pitch']:.2f}"
+                            )
+                            print(
+                                "Horizontal eye: "
+                                f"{centre_calibration['horizontal_eye']:.3f}"
+                            )
+                            print(
+                                "Vertical eye: "
+                                f"{centre_calibration['vertical_eye']:.3f}"
+                            )
+
+                    # Draw a simple visual head-direction indicator.
+                    nose_landmark = face_landmarks[
+                        HEAD_POSE_LANDMARKS["nose"]
+                    ]
+
+                    nose_x = int(
+                        nose_landmark.x * frame_width
+                    )
+
+                    nose_y = int(
+                        nose_landmark.y * frame_height
+                    )
 
                     line_length = 100
 
-                    direction_x = int(nose_x + line_length * math.sin(math.radians(yaw)))
-                    direction_y = int(nose_y - line_length * math.sin(math.radians(pitch)))
+                    direction_x = int(
+                        nose_x
+                        + line_length
+                        * math.sin(math.radians(yaw))
+                    )
 
-                    cv2.line(frame,(nose_x, nose_y),(direction_x, direction_y),(255, 0, 0),2,)
+                    direction_y = int(
+                        nose_y
+                        - line_length
+                        * math.sin(math.radians(pitch))
+                    )
 
-                    
+                    cv2.line(
+                        frame,
+                        (nose_x, nose_y),
+                        (direction_x, direction_y),
+                        (255, 0, 0),
+                        2,
+                    )
 
                     cv2.putText(
                         frame,
@@ -277,7 +541,88 @@ def main():
                         2,
                     )
 
-            # Calculate approximate instantaneous FPS.
+                # ---------------------------------------------------------
+                # Display eye-position measurements
+                # ---------------------------------------------------------
+
+                if left_eye_ratio is not None:
+                    cv2.putText(
+                        frame,
+                        f"Left eye: {left_eye_ratio:.3f}",
+                        (20, 180),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
+
+                if right_eye_ratio is not None:
+                    cv2.putText(
+                        frame,
+                        f"Right eye: {right_eye_ratio:.3f}",
+                        (20, 210),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
+
+                if combined_eye_ratio is not None:
+                    cv2.putText(
+                        frame,
+                        f"Combined eye: {combined_eye_ratio:.3f}",
+                        (20, 240),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
+
+                if combined_vertical_ratio is not None:
+                    cv2.putText(
+                        frame,
+                        f"Vertical eye: {combined_vertical_ratio:.3f}",
+                        (20, 270),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                    )
+
+            # -------------------------------------------------------------
+            # Calibration status
+            # -------------------------------------------------------------
+
+            if calibration_active:
+                cv2.putText(
+                    frame,
+                    (
+                        "CALIBRATING CENTRE: "
+                        f"{len(calibration_samples)}/"
+                        f"{calibration_target_samples}"
+                    ),
+                    (20, 310),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 0, 255),
+                    2,
+                )
+
+            elif centre_calibration is not None:
+                cv2.putText(
+                    frame,
+                    "CENTRE CALIBRATED",
+                    (20, 310),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                )
+
+            # -------------------------------------------------------------
+            # FPS calculation
+            # -------------------------------------------------------------
+
             current_time = time.perf_counter()
             elapsed_time = current_time - previous_time
 
@@ -299,12 +644,28 @@ def main():
             )
 
             cv2.imshow(
-                "Privacy Screen - Head Pose",
+                "Privacy Screen - Head and Eye Tracking",
                 frame,
             )
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            # -------------------------------------------------------------
+            # Keyboard controls
+            # -------------------------------------------------------------
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord("q"):
                 break
+
+            if key == ord("c"):
+                calibration_samples.clear()
+                centre_calibration = None
+                calibration_active = True
+
+                print(
+                    "\nCentre calibration started. "
+                    "Look naturally at the centre of the screen."
+                )
 
     camera.release()
     cv2.destroyAllWindows()
