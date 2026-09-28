@@ -6,6 +6,8 @@ import mediapipe as mp
 MODEL_PATH = Path("models/face_landmarker.task")
 
 
+
+
 def main():
     if not MODEL_PATH.exists():
         print(f"Model not found: {MODEL_PATH}")
