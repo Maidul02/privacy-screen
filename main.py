@@ -138,7 +138,6 @@ def rotation_matrix_to_euler_angles(rotation_matrix):
 def normalize_pitch(pitch):
     """Shift the current pitch convention to a centre-relative range."""
     shifted_pitch = pitch - 180.0
-
     return (shifted_pitch + 180.0) % 360.0 - 180.0
 
 
@@ -221,6 +220,124 @@ def estimate_head_pose(
     return yaw, pitch, roll
 
 
+def classify_attention(
+    relative_yaw,
+    relative_horizontal_eye,
+    left_boundary,
+    right_boundary,
+):
+    """
+    Classify the current frame as LOOKING, UNCERTAIN, or AWAY.
+
+    For the current experimental stage, only horizontal evidence
+    is used for the attention decision. Vertical measurements are
+    still collected for diagnostics and future improvement.
+    """
+
+    if left_boundary is None or right_boundary is None:
+        return "NOT CALIBRATED"
+
+    if (
+        relative_yaw is None
+        or relative_horizontal_eye is None
+    ):
+        return "UNCERTAIN"
+
+    # Calculate the user's calibrated horizontal screen ranges.
+    horizontal_yaw_range = (
+        right_boundary["yaw"]
+        - left_boundary["yaw"]
+    )
+
+    horizontal_eye_range = (
+        left_boundary["horizontal_eye"]
+        - right_boundary["horizontal_eye"]
+    )
+
+    # Initial experimental tolerance:
+    # 20% of the user's own calibrated horizontal range.
+    yaw_tolerance = abs(horizontal_yaw_range) * 0.20
+    eye_tolerance = abs(horizontal_eye_range) * 0.20
+
+    # Head-pose limits.
+    left_yaw_limit = (
+        left_boundary["yaw"]
+        - yaw_tolerance
+    )
+
+    right_yaw_limit = (
+        right_boundary["yaw"]
+        + yaw_tolerance
+    )
+
+    # Eye limits.
+    #
+    # The combined eye ratio increases toward the user's left
+    # and decreases toward the user's right.
+    left_eye_limit = (
+        left_boundary["horizontal_eye"]
+        + eye_tolerance
+    )
+
+    right_eye_limit = (
+        right_boundary["horizontal_eye"]
+        - eye_tolerance
+    )
+
+    # Check whether each horizontal signal is outside
+    # its tolerated screen region.
+    head_left_away = relative_yaw < left_yaw_limit
+    head_right_away = relative_yaw > right_yaw_limit
+
+    eye_left_away = (
+        relative_horizontal_eye > left_eye_limit
+    )
+
+    eye_right_away = (
+        relative_horizontal_eye < right_eye_limit
+    )
+
+    # Strong AWAY evidence:
+    # head and eyes agree on the same direction.
+    if head_left_away and eye_left_away:
+        return "AWAY"
+
+    if head_right_away and eye_right_away:
+        return "AWAY"
+
+    # If only one signal says the user is outside the screen,
+    # the evidence is conflicting.
+    if (
+        head_left_away
+        or head_right_away
+        or eye_left_away
+        or eye_right_away
+    ):
+        return "UNCERTAIN"
+
+    return "LOOKING"
+
+
+def average_calibration_samples(samples):
+    """Calculate the average measurements from calibration samples."""
+    sample_count = len(samples)
+
+    return {
+        "yaw": sum(
+            sample["yaw"] for sample in samples
+        ) / sample_count,
+        "pitch": sum(
+            sample["pitch"] for sample in samples
+        ) / sample_count,
+        "horizontal_eye": sum(
+            sample["horizontal_eye"] for sample in samples
+        ) / sample_count,
+        "vertical_eye": sum(
+            sample["vertical_eye"] for sample in samples
+        ) / sample_count,
+    }
+
+
 def main():
     if not MODEL_PATH.exists():
         print(f"Error: Model not found: {MODEL_PATH}")
@@ -244,16 +361,41 @@ def main():
 
     print("Webcam started.")
     print("Press C to calibrate the screen centre.")
+    print("Press L to calibrate the left screen boundary.")
+    print("Press R to calibrate the right screen boundary.")
+    print("Press T to calibrate the top screen boundary.")
+    print("Press B to calibrate the bottom screen boundary.")
     print("Press Q to quit.")
 
     previous_time = time.perf_counter()
     start_time = time.perf_counter()
 
-    # Centre-calibration state.
-    calibration_active = False
     calibration_target_samples = 90
+
+    # Centre calibration.
+    calibration_active = False
     calibration_samples = []
     centre_calibration = None
+
+    # Left boundary.
+    left_calibration_active = False
+    left_calibration_samples = []
+    left_boundary = None
+
+    # Right boundary.
+    right_calibration_active = False
+    right_calibration_samples = []
+    right_boundary = None
+
+    # Top boundary.
+    top_calibration_active = False
+    top_calibration_samples = []
+    top_boundary = None
+
+    # Bottom boundary.
+    bottom_calibration_active = False
+    bottom_calibration_samples = []
+    bottom_boundary = None
 
     with mp.tasks.vision.FaceLandmarker.create_from_options(
         options
@@ -266,19 +408,16 @@ def main():
                 print("Error: Could not read frame from webcam.")
                 break
 
-            # OpenCV provides webcam frames in BGR format.
             rgb_frame = cv2.cvtColor(
                 frame,
                 cv2.COLOR_BGR2RGB,
             )
 
-            # Convert the NumPy RGB frame to a MediaPipe image.
             mp_image = mp.Image(
                 image_format=mp.ImageFormat.SRGB,
                 data=rgb_frame,
             )
 
-            # VIDEO mode requires increasing timestamps in milliseconds.
             timestamp_ms = int(
                 (time.perf_counter() - start_time) * 1000
             )
@@ -290,13 +429,20 @@ def main():
 
             frame_height, frame_width = frame.shape[:2]
 
+            # Reset per-frame measurements.
+            relative_yaw = None
+            relative_pitch = None
+            relative_horizontal_eye = None
+            relative_vertical_eye = None
+
+            attention_state = "NOT CALIBRATED"
+
             if result.face_landmarks:
-                # num_faces=1, so use the first detected face.
                 face_landmarks = result.face_landmarks[0]
 
-                # ---------------------------------------------------------
+                # -----------------------------------------------------
                 # Horizontal eye-position estimation
-                # ---------------------------------------------------------
+                # -----------------------------------------------------
 
                 left_eye_ratio = calculate_horizontal_eye_ratio(
                     face_landmarks,
@@ -314,8 +460,6 @@ def main():
                     left_eye_ratio is not None
                     and right_eye_ratio is not None
                 ):
-                    # The two eyes use opposite horizontal directions.
-                    # Flip the right-eye ratio before combining them.
                     normalized_right_eye_ratio = (
                         1.0 - right_eye_ratio
                     )
@@ -325,9 +469,9 @@ def main():
                         + normalized_right_eye_ratio
                     ) / 2
 
-                # ---------------------------------------------------------
+                # -----------------------------------------------------
                 # Vertical eye-position estimation
-                # ---------------------------------------------------------
+                # -----------------------------------------------------
 
                 left_vertical_ratio = calculate_vertical_eye_ratio(
                     face_landmarks,
@@ -350,9 +494,9 @@ def main():
                         + right_vertical_ratio
                     ) / 2
 
-                # ---------------------------------------------------------
-                # Draw all facial landmarks
-                # ---------------------------------------------------------
+                # -----------------------------------------------------
+                # Draw facial landmarks
+                # -----------------------------------------------------
 
                 for landmark in face_landmarks:
                     pixel_x = int(
@@ -371,10 +515,7 @@ def main():
                         -1,
                     )
 
-                # ---------------------------------------------------------
-                # Highlight iris landmarks
-                # ---------------------------------------------------------
-
+                # Highlight iris landmarks.
                 for iris_index in (
                     LEFT_EYE["iris"],
                     RIGHT_EYE["iris"],
@@ -397,9 +538,9 @@ def main():
                         -1,
                     )
 
-                # ---------------------------------------------------------
+                # -----------------------------------------------------
                 # Head-pose estimation
-                # ---------------------------------------------------------
+                # -----------------------------------------------------
 
                 head_pose = estimate_head_pose(
                     face_landmarks,
@@ -410,9 +551,9 @@ def main():
                 if head_pose is not None:
                     yaw, pitch, roll = head_pose
 
-                    # -----------------------------------------------------
+                    # -------------------------------------------------
                     # Centre calibration
-                    # -----------------------------------------------------
+                    # -------------------------------------------------
 
                     if (
                         calibration_active
@@ -432,33 +573,17 @@ def main():
                             len(calibration_samples)
                             >= calibration_target_samples
                         ):
-                            sample_count = len(calibration_samples)
-
-                            centre_calibration = {
-                                "yaw": sum(
-                                    sample["yaw"]
-                                    for sample in calibration_samples
-                                ) / sample_count,
-
-                                "pitch": sum(
-                                    sample["pitch"]
-                                    for sample in calibration_samples
-                                ) / sample_count,
-
-                                "horizontal_eye": sum(
-                                    sample["horizontal_eye"]
-                                    for sample in calibration_samples
-                                ) / sample_count,
-
-                                "vertical_eye": sum(
-                                    sample["vertical_eye"]
-                                    for sample in calibration_samples
-                                ) / sample_count,
-                            }
+                            centre_calibration = (
+                                average_calibration_samples(
+                                    calibration_samples
+                                )
+                            )
 
                             calibration_active = False
 
-                            print("\nCentre calibration complete:")
+                            print(
+                                "\nCentre calibration complete:"
+                            )
                             print(
                                 "Yaw: "
                                 f"{centre_calibration['yaw']:.2f}"
@@ -476,7 +601,228 @@ def main():
                                 f"{centre_calibration['vertical_eye']:.3f}"
                             )
 
-                    # Draw a simple visual head-direction indicator.
+                    # -------------------------------------------------
+                    # Relative measurements
+                    # -------------------------------------------------
+
+                    if centre_calibration is not None:
+                        relative_yaw = (
+                            yaw
+                            - centre_calibration["yaw"]
+                        )
+
+                        relative_pitch = (
+                            pitch
+                            - centre_calibration["pitch"]
+                        )
+
+                        if combined_eye_ratio is not None:
+                            relative_horizontal_eye = (
+                                combined_eye_ratio
+                                - centre_calibration[
+                                    "horizontal_eye"
+                                ]
+                            )
+
+                        if combined_vertical_ratio is not None:
+                            relative_vertical_eye = (
+                                combined_vertical_ratio
+                                - centre_calibration[
+                                    "vertical_eye"
+                                ]
+                            )
+
+                    # -------------------------------------------------
+                    # Left boundary calibration
+                    # -------------------------------------------------
+
+                    if (
+                        left_calibration_active
+                        and relative_yaw is not None
+                        and relative_pitch is not None
+                        and relative_horizontal_eye is not None
+                        and relative_vertical_eye is not None
+                    ):
+                        left_calibration_samples.append(
+                            {
+                                "yaw": relative_yaw,
+                                "pitch": relative_pitch,
+                                "horizontal_eye": relative_horizontal_eye,
+                                "vertical_eye": relative_vertical_eye,
+                            }
+                        )
+
+                        if (
+                            len(left_calibration_samples)
+                            >= calibration_target_samples
+                        ):
+                            left_boundary = (
+                                average_calibration_samples(
+                                    left_calibration_samples
+                                )
+                            )
+
+                            left_calibration_active = False
+
+                            print(
+                                "\nLEFT screen boundary calibrated:"
+                            )
+                            print(
+                                "Relative yaw: "
+                                f"{left_boundary['yaw']:.2f}"
+                            )
+                            print(
+                                "Relative horizontal eye: "
+                                f"{left_boundary['horizontal_eye']:.3f}"
+                            )
+
+                    # -------------------------------------------------
+                    # Right boundary calibration
+                    # -------------------------------------------------
+
+                    if (
+                        right_calibration_active
+                        and relative_yaw is not None
+                        and relative_pitch is not None
+                        and relative_horizontal_eye is not None
+                        and relative_vertical_eye is not None
+                    ):
+                        right_calibration_samples.append(
+                            {
+                                "yaw": relative_yaw,
+                                "pitch": relative_pitch,
+                                "horizontal_eye": relative_horizontal_eye,
+                                "vertical_eye": relative_vertical_eye,
+                            }
+                        )
+
+                        if (
+                            len(right_calibration_samples)
+                            >= calibration_target_samples
+                        ):
+                            right_boundary = (
+                                average_calibration_samples(
+                                    right_calibration_samples
+                                )
+                            )
+
+                            right_calibration_active = False
+
+                            print(
+                                "\nRIGHT screen boundary calibrated:"
+                            )
+                            print(
+                                "Relative yaw: "
+                                f"{right_boundary['yaw']:.2f}"
+                            )
+                            print(
+                                "Relative horizontal eye: "
+                                f"{right_boundary['horizontal_eye']:.3f}"
+                            )
+
+                    # -------------------------------------------------
+                    # Top boundary calibration
+                    # -------------------------------------------------
+
+                    if (
+                        top_calibration_active
+                        and relative_yaw is not None
+                        and relative_pitch is not None
+                        and relative_horizontal_eye is not None
+                        and relative_vertical_eye is not None
+                    ):
+                        top_calibration_samples.append(
+                            {
+                                "yaw": relative_yaw,
+                                "pitch": relative_pitch,
+                                "horizontal_eye": relative_horizontal_eye,
+                                "vertical_eye": relative_vertical_eye,
+                            }
+                        )
+
+                        if (
+                            len(top_calibration_samples)
+                            >= calibration_target_samples
+                        ):
+                            top_boundary = (
+                                average_calibration_samples(
+                                    top_calibration_samples
+                                )
+                            )
+
+                            top_calibration_active = False
+
+                            print(
+                                "\nTOP screen boundary calibrated:"
+                            )
+                            print(
+                                "Relative pitch: "
+                                f"{top_boundary['pitch']:.2f}"
+                            )
+                            print(
+                                "Relative vertical eye: "
+                                f"{top_boundary['vertical_eye']:.3f}"
+                            )
+
+                    # -------------------------------------------------
+                    # Bottom boundary calibration
+                    # -------------------------------------------------
+
+                    if (
+                        bottom_calibration_active
+                        and relative_yaw is not None
+                        and relative_pitch is not None
+                        and relative_horizontal_eye is not None
+                        and relative_vertical_eye is not None
+                    ):
+                        bottom_calibration_samples.append(
+                            {
+                                "yaw": relative_yaw,
+                                "pitch": relative_pitch,
+                                "horizontal_eye": relative_horizontal_eye,
+                                "vertical_eye": relative_vertical_eye,
+                            }
+                        )
+
+                        if (
+                            len(bottom_calibration_samples)
+                            >= calibration_target_samples
+                        ):
+                            bottom_boundary = (
+                                average_calibration_samples(
+                                    bottom_calibration_samples
+                                )
+                            )
+
+                            bottom_calibration_active = False
+
+                            print(
+                                "\nBOTTOM screen boundary calibrated:"
+                            )
+                            print(
+                                "Relative pitch: "
+                                f"{bottom_boundary['pitch']:.2f}"
+                            )
+                            print(
+                                "Relative vertical eye: "
+                                f"{bottom_boundary['vertical_eye']:.3f}"
+                            )
+
+                    # -------------------------------------------------
+                    # Raw attention classification
+                    # -------------------------------------------------
+
+                    attention_state = classify_attention(
+                        relative_yaw,
+                        relative_horizontal_eye,
+                        left_boundary,
+                        right_boundary,
+                    )
+
+                    # -------------------------------------------------
+                    # Head-direction indicator
+                    # -------------------------------------------------
+
                     nose_landmark = face_landmarks[
                         HEAD_POSE_LANDMARKS["nose"]
                     ]
@@ -541,9 +887,9 @@ def main():
                         2,
                     )
 
-                # ---------------------------------------------------------
-                # Display eye-position measurements
-                # ---------------------------------------------------------
+                # -----------------------------------------------------
+                # Eye measurements
+                # -----------------------------------------------------
 
                 if left_eye_ratio is not None:
                     cv2.putText(
@@ -589,39 +935,131 @@ def main():
                         2,
                     )
 
-            # -------------------------------------------------------------
-            # Calibration status
-            # -------------------------------------------------------------
+            # ---------------------------------------------------------
+            # Calibration / measurement status
+            # ---------------------------------------------------------
 
             if calibration_active:
-                cv2.putText(
-                    frame,
-                    (
-                        "CALIBRATING CENTRE: "
-                        f"{len(calibration_samples)}/"
-                        f"{calibration_target_samples}"
-                    ),
-                    (20, 310),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 0, 255),
-                    2,
+                centre_status = (
+                    "CALIBRATING CENTRE: "
+                    f"{len(calibration_samples)}/"
+                    f"{calibration_target_samples}"
                 )
-
             elif centre_calibration is not None:
+                centre_status = "CENTRE CALIBRATED"
+            else:
+                centre_status = "CENTRE NOT CALIBRATED"
+
+            cv2.putText(
+                frame,
+                centre_status,
+                (20, 310),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+            )
+
+            if (
+                centre_calibration is not None
+                and relative_yaw is not None
+                and relative_pitch is not None
+            ):
                 cv2.putText(
                     frame,
-                    "CENTRE CALIBRATED",
-                    (20, 310),
+                    f"Rel yaw: {relative_yaw:+.1f}",
+                    (20, 340),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 0),
+                    0.55,
+                    (255, 255, 0),
                     2,
                 )
 
-            # -------------------------------------------------------------
-            # FPS calculation
-            # -------------------------------------------------------------
+                cv2.putText(
+                    frame,
+                    f"Rel pitch: {relative_pitch:+.1f}",
+                    (20, 365),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 0),
+                    2,
+                )
+
+                if relative_horizontal_eye is not None:
+                    cv2.putText(
+                        frame,
+                        (
+                            "Rel H-eye: "
+                            f"{relative_horizontal_eye:+.3f}"
+                        ),
+                        (20, 390),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (255, 255, 0),
+                        2,
+                    )
+
+                if relative_vertical_eye is not None:
+                    cv2.putText(
+                        frame,
+                        (
+                            "Rel V-eye: "
+                            f"{relative_vertical_eye:+.3f}"
+                        ),
+                        (20, 415),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (255, 255, 0),
+                        2,
+                    )
+
+            # ---------------------------------------------------------
+            # Compact boundary status
+            # ---------------------------------------------------------
+
+            boundary_status = (
+                f"L:{'Y' if left_boundary is not None else 'N'} "
+                f"R:{'Y' if right_boundary is not None else 'N'} "
+                f"T:{'Y' if top_boundary is not None else 'N'} "
+                f"B:{'Y' if bottom_boundary is not None else 'N'}"
+            )
+
+            cv2.putText(
+                frame,
+                boundary_status,
+                (20, 445),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+            )
+
+            # ---------------------------------------------------------
+            # Raw attention state
+            # ---------------------------------------------------------
+
+            if attention_state == "LOOKING":
+                state_color = (0, 255, 0)
+
+            elif attention_state == "AWAY":
+                state_color = (0, 0, 255)
+
+            else:
+                state_color = (0, 255, 255)
+
+            cv2.putText(
+                frame,
+                f"RAW STATE: {attention_state}",
+                (20, 475),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                state_color,
+                2,
+            )
+
+            # ---------------------------------------------------------
+            # FPS
+            # ---------------------------------------------------------
 
             current_time = time.perf_counter()
             elapsed_time = current_time - previous_time
@@ -648,9 +1086,9 @@ def main():
                 frame,
             )
 
-            # -------------------------------------------------------------
+            # ---------------------------------------------------------
             # Keyboard controls
-            # -------------------------------------------------------------
+            # ---------------------------------------------------------
 
             key = cv2.waitKey(1) & 0xFF
 
@@ -660,12 +1098,91 @@ def main():
             if key == ord("c"):
                 calibration_samples.clear()
                 centre_calibration = None
+
+                # A new centre changes the coordinate system,
+                # so all previous boundaries become invalid.
+                left_calibration_active = False
+                left_calibration_samples.clear()
+                left_boundary = None
+
+                right_calibration_active = False
+                right_calibration_samples.clear()
+                right_boundary = None
+
+                top_calibration_active = False
+                top_calibration_samples.clear()
+                top_boundary = None
+
+                bottom_calibration_active = False
+                bottom_calibration_samples.clear()
+                bottom_boundary = None
+
                 calibration_active = True
 
                 print(
                     "\nCentre calibration started. "
                     "Look naturally at the centre of the screen."
                 )
+
+            if key == ord("l"):
+                if centre_calibration is None:
+                    print(
+                        "\nCalibrate the centre first by pressing C."
+                    )
+                else:
+                    left_calibration_samples.clear()
+                    left_boundary = None
+                    left_calibration_active = True
+
+                    print(
+                        "\nLEFT boundary calibration started. "
+                        "Look naturally at the left edge of the screen."
+                    )
+
+            if key == ord("r"):
+                if centre_calibration is None:
+                    print(
+                        "\nCalibrate the centre first by pressing C."
+                    )
+                else:
+                    right_calibration_samples.clear()
+                    right_boundary = None
+                    right_calibration_active = True
+
+                    print(
+                        "\nRIGHT boundary calibration started. "
+                        "Look naturally at the right edge of the screen."
+                    )
+
+            if key == ord("t"):
+                if centre_calibration is None:
+                    print(
+                        "\nCalibrate the centre first by pressing C."
+                    )
+                else:
+                    top_calibration_samples.clear()
+                    top_boundary = None
+                    top_calibration_active = True
+
+                    print(
+                        "\nTOP boundary calibration started. "
+                        "Look naturally at the top edge of the screen."
+                    )
+
+            if key == ord("b"):
+                if centre_calibration is None:
+                    print(
+                        "\nCalibrate the centre first by pressing C."
+                    )
+                else:
+                    bottom_calibration_samples.clear()
+                    bottom_boundary = None
+                    bottom_calibration_active = True
+
+                    print(
+                        "\nBOTTOM boundary calibration started. "
+                        "Look naturally at the bottom edge of the screen."
+                    )
 
     camera.release()
     cv2.destroyAllWindows()
